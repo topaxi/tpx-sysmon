@@ -1,0 +1,12 @@
+[package]
+name = "tpx-sysmon"
+version = "0.1.0"
+edition = "2024"
+description = "Linux system-monitoring data sources (CPU, memory, battery, GPU, sensors)"
+
+[dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["process", "sync", "time", "rt"] }
+tracing = "0.1"
