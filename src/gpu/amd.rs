@@ -1,11 +1,13 @@
 use anyhow::Result;
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
 use tracing::{debug, warn};
 
 use crate::gpu::{GpuConfig, GpuInfo, GpuProvider, GpuState};
+use crate::util::read_trimmed;
 
 /// Scan `/sys/bus/pci/devices/` and return all PCI IDs that expose an `amdgpu`
 /// hwmon (used for auto-discovery when no explicit configs are provided).
@@ -76,9 +78,16 @@ pub async fn run(
         configs
     };
 
+    let resolved = Arc::new(resolved);
+    let vk_types = Arc::new(vk_types);
     let interval = Duration::from_millis(poll_ms);
     loop {
-        tx.send_replace(read_state(&resolved, &vk_types));
+        let configs = Arc::clone(&resolved);
+        let vk = Arc::clone(&vk_types);
+        let state = tokio::task::spawn_blocking(move || read_state(&configs, &vk))
+            .await
+            .unwrap_or_default();
+        tx.send_replace(state);
         tokio::time::sleep(interval).await;
     }
 }
@@ -131,7 +140,7 @@ fn read_state(configs: &[GpuConfig], vk_types: &HashMap<u32, bool>) -> GpuState 
         gpus.push(GpuInfo {
             id: id.clone(),
             label,
-            provider: "amd".to_string(),
+            provider: GpuProvider::Amd,
             gpu_usage,
             mem_used,
             mem_total,
@@ -211,8 +220,84 @@ fn read_power(hwmon: &Path) -> f64 {
     0.0
 }
 
-fn read_trimmed(path: impl AsRef<Path>) -> Option<String> {
-    std::fs::read_to_string(path)
-        .ok()
-        .map(|s| s.trim().to_string())
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    struct TmpDir(PathBuf);
+
+    impl TmpDir {
+        fn new() -> Self {
+            static COUNTER: AtomicU32 = AtomicU32::new(0);
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path =
+                std::env::temp_dir().join(format!("tpx-amd-test-{}-{n}", std::process::id()));
+            fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+
+        fn write(&self, name: &str, contents: &str) {
+            fs::write(self.0.join(name), contents).unwrap();
+        }
+    }
+
+    impl Drop for TmpDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn read_temp_prefers_junction_over_edge() {
+        let tmp = TmpDir::new();
+        tmp.write("temp1_label", "edge\n");
+        tmp.write("temp1_input", "44000\n");
+        tmp.write("temp2_label", "junction\n");
+        tmp.write("temp2_input", "57000\n");
+        tmp.write("temp3_label", "mem\n");
+        tmp.write("temp3_input", "64000\n");
+
+        assert_eq!(read_temp(&tmp.0), 57.0);
+    }
+
+    #[test]
+    fn read_temp_falls_back_to_edge_then_any() {
+        let edge = TmpDir::new();
+        edge.write("temp1_label", "edge\n");
+        edge.write("temp1_input", "40000\n");
+        assert_eq!(read_temp(&edge.0), 40.0);
+
+        let other = TmpDir::new();
+        other.write("temp1_label", "mem\n");
+        other.write("temp1_input", "66000\n");
+        assert_eq!(read_temp(&other.0), 66.0);
+    }
+
+    #[test]
+    fn read_temp_missing_is_zero() {
+        assert_eq!(read_temp(Path::new("/nonexistent/hwmon")), 0.0);
+    }
+
+    #[test]
+    fn read_power_prefers_average_and_converts_micro_watts() {
+        let tmp = TmpDir::new();
+        tmp.write("power1_average", "48000000\n");
+        tmp.write("power1_input", "50030000\n");
+        assert_eq!(read_power(&tmp.0), 48.0);
+    }
+
+    #[test]
+    fn read_power_falls_back_to_input() {
+        let tmp = TmpDir::new();
+        tmp.write("power1_input", "50030000\n");
+        assert!((read_power(&tmp.0) - 50.03).abs() < 1e-9);
+    }
+
+    #[test]
+    fn read_power_missing_is_zero() {
+        assert_eq!(read_power(Path::new("/nonexistent/hwmon")), 0.0);
+    }
 }

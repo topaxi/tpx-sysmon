@@ -17,7 +17,7 @@ pub struct MemoryState {
 
 pub async fn run(tx: watch::Sender<MemoryState>) -> Result<()> {
     loop {
-        if let Some(state) = read_meminfo() {
+        if let Some(state) = read_meminfo().await {
             debug!(
                 "Memory: {:.1}% used, swap {:.1}%",
                 state.usage * 100.0,
@@ -29,9 +29,17 @@ pub async fn run(tx: watch::Sender<MemoryState>) -> Result<()> {
     }
 }
 
-fn read_meminfo() -> Option<MemoryState> {
-    let content = std::fs::read_to_string("/proc/meminfo").ok()?;
+async fn read_meminfo() -> Option<MemoryState> {
+    tokio::task::spawn_blocking(|| {
+        let content = std::fs::read_to_string("/proc/meminfo").ok()?;
+        parse_meminfo(&content)
+    })
+    .await
+    .ok()
+    .flatten()
+}
 
+fn parse_meminfo(content: &str) -> Option<MemoryState> {
     let fields: HashMap<&str, u64> = content
         .lines()
         .filter_map(|line| {
@@ -43,7 +51,7 @@ fn read_meminfo() -> Option<MemoryState> {
         .collect();
 
     let total_kb = *fields.get("MemTotal")?;
-    let available_kb = *fields.get("MemAvailable").unwrap_or(&0);
+    let available_kb = *fields.get("MemAvailable")?;
 
     let total = total_kb * 1024;
     let available = available_kb * 1024;
@@ -71,4 +79,38 @@ fn read_meminfo() -> Option<MemoryState> {
         swap_total_bytes: swap_total,
         swap_usage,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn computes_used_and_swap() {
+        let content = "MemTotal:       16000000 kB\n\
+            MemFree:         2000000 kB\n\
+            MemAvailable:    8000000 kB\n\
+            SwapTotal:       4000000 kB\n\
+            SwapFree:        3000000 kB\n";
+        let s = parse_meminfo(content).unwrap();
+        assert_eq!(s.total_bytes, 16_000_000 * 1024);
+        assert_eq!(s.used_bytes, (16_000_000 - 8_000_000) * 1024);
+        assert!((s.usage - 0.5).abs() < 1e-9);
+        assert_eq!(s.swap_used_bytes, 1_000_000 * 1024);
+        assert!((s.swap_usage - 0.25).abs() < 1e-9);
+    }
+
+    #[test]
+    fn no_swap_reports_zero_usage() {
+        let content = "MemTotal: 16000000 kB\nMemAvailable: 8000000 kB\n";
+        let s = parse_meminfo(content).unwrap();
+        assert_eq!(s.swap_total_bytes, 0);
+        assert_eq!(s.swap_usage, 0.0);
+    }
+
+    #[test]
+    fn missing_required_field_is_none() {
+        assert!(parse_meminfo("MemFree: 100 kB\n").is_none());
+        assert!(parse_meminfo("MemTotal: 16000000 kB\n").is_none());
+    }
 }

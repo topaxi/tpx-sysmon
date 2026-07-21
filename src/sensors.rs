@@ -58,12 +58,19 @@ pub async fn run(tx: watch::Sender<SensorsState>, specs: Vec<SensorSpec>) -> Res
 }
 
 async fn read_sensors(specs: &[SensorSpec]) -> Result<SensorsState> {
+    // `-J` (documented in `man sensors` as the new JSON output) emits nested
+    // `{value, unit}` objects per sensor; the older `-j` emits a flat schema
+    // this parser does not understand, so the flag choice is load-bearing.
     let output = tokio::process::Command::new("sensors")
         .arg("-J")
         .output()
         .await?;
 
     let json: Value = serde_json::from_slice(&output.stdout)?;
+    parse_sensors(&json, specs)
+}
+
+fn parse_sensors(json: &Value, specs: &[SensorSpec]) -> Result<SensorsState> {
     let obj = json
         .as_object()
         .ok_or_else(|| anyhow::anyhow!("sensors -J output is not a JSON object"))?;
@@ -213,7 +220,14 @@ fn auto_discover(
             .partial_cmp(&a.value)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
-    candidates.truncate(4);
+    const MAX_EXTRA: usize = 4;
+    if candidates.len() > MAX_EXTRA {
+        debug!(
+            "auto-discovered {} sensors, keeping the {MAX_EXTRA} hottest",
+            candidates.len()
+        );
+    }
+    candidates.truncate(MAX_EXTRA);
     candidates
 }
 
@@ -282,4 +296,123 @@ fn compute_status(sensor: &Value, value: f64) -> SensorStatus {
     }
 
     SensorStatus::Normal
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn sample() -> Value {
+        json!({
+            "amdgpu-pci-0300": {
+                "Adapter": "PCI adapter",
+                "temp1": {
+                    "label": "edge",
+                    "input": {"unit": "°C", "value": 44.0},
+                    "crit": {"value": 100.0}
+                },
+                "temp2": {
+                    "label": "junction",
+                    "input": {"unit": "°C", "value": 57.0},
+                    "crit": {"value": 110.0}
+                }
+            },
+            "nvme-pci-1300": {
+                "Adapter": "PCI adapter",
+                "temp1": {"label": "Composite", "input": {"unit": "°C", "value": 29.85}},
+                "temp3": {"label": "Sensor 2", "input": {"unit": "°C", "value": 48.85}}
+            },
+            "k10temp-pci-00c3": {
+                "Adapter": "PCI adapter",
+                "temp1": {"label": "Tctl", "input": {"unit": "°C", "value": 46.875}}
+            },
+            "acpitz-acpi-0": {
+                "temp1": {"input": {"unit": "°C", "value": 55.0}}
+            },
+            "ucsi_source_psy-i2c-1": {
+                "temp1": {"input": {"unit": "°C", "value": 40.0}}
+            },
+            "nct6799-isa-0290": {
+                "in0": {"input": {"unit": "V", "value": 0.88}}
+            },
+            "bogus-hot": {
+                "temp1": {"input": {"unit": "°C", "value": 200.0}}
+            },
+            "bogus-cold": {
+                "temp1": {"input": {"unit": "°C", "value": 10.0}}
+            }
+        })
+    }
+
+    #[test]
+    fn configured_sensor_matched_by_label() {
+        let specs = vec![SensorSpec {
+            device: "amdgpu-pci-0300".to_string(),
+            sensors: vec!["junction".to_string()],
+        }];
+        let state = parse_sensors(&sample(), &specs).unwrap();
+
+        assert_eq!(state.readings.len(), 1);
+        let r = &state.readings[0];
+        assert_eq!(r.sensor, "junction");
+        assert_eq!(r.value, 57.0);
+        assert_eq!(r.unit, "°C");
+        assert_eq!(r.status, SensorStatus::Normal);
+    }
+
+    #[test]
+    fn auto_discover_filters_and_labels() {
+        // No specs: everything goes through auto-discovery.
+        let state = parse_sensors(&sample(), &[]).unwrap();
+
+        let names: Vec<&str> = state.extra.iter().map(|r| r.sensor.as_str()).collect();
+        // acpitz/ucsi are dropped, voltage-only and out-of-range chips too.
+        assert!(state.extra.iter().all(|r| r.unit == "°C"));
+        assert!(names.iter().any(|n| n.starts_with("NVMe: ")));
+        assert!(names.iter().any(|n| n.starts_with("k10temp: Tctl")));
+        assert!(!names.iter().any(|n| n.contains("acpitz")));
+        assert!(state.extra.iter().all(|r| r.value >= 25.0 && r.value <= 150.0));
+        // amdgpu, nvme, k10temp survive; acpitz, ucsi, nct6799(V), bogus-* dropped.
+        assert_eq!(state.extra.len(), 3);
+        // Sorted hottest first.
+        assert!(state.extra.windows(2).all(|w| w[0].value >= w[1].value));
+    }
+
+    #[test]
+    fn configured_device_excluded_from_extra() {
+        let specs = vec![SensorSpec {
+            device: "amdgpu-pci-0300".to_string(),
+            sensors: vec!["junction".to_string()],
+        }];
+        let state = parse_sensors(&sample(), &specs).unwrap();
+        assert!(!state.extra.iter().any(|r| r.device == "amdgpu-pci-0300"));
+    }
+
+    #[test]
+    fn status_alarm_takes_precedence() {
+        let sensor = json!({"crit_alarm": {"value": 1.0}, "input": {"value": 30.0}});
+        assert_eq!(compute_status(&sensor, 30.0), SensorStatus::Critical);
+    }
+
+    #[test]
+    fn status_crit_and_max_thresholds() {
+        let crit = json!({"crit": {"value": 100.0}});
+        assert_eq!(compute_status(&crit, 100.0), SensorStatus::Critical);
+
+        let max = json!({"max": {"value": 50.0}});
+        assert_eq!(compute_status(&max, 60.0), SensorStatus::Warning);
+
+        // A zero max (common on sensors without a real limit) is ignored.
+        let zero_max = json!({"max": {"value": 0.0}});
+        assert_eq!(compute_status(&zero_max, 60.0), SensorStatus::Normal);
+    }
+
+    #[test]
+    fn status_absolute_fallbacks() {
+        let bare = json!({});
+        assert_eq!(compute_status(&bare, 92.0), SensorStatus::Critical);
+        assert_eq!(compute_status(&bare, 80.0), SensorStatus::Warning);
+        assert_eq!(compute_status(&bare, 50.0), SensorStatus::Normal);
+    }
 }

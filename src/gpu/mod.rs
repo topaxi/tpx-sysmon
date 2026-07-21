@@ -16,7 +16,7 @@ pub struct GpuInfo {
     pub id: String,
     /// Human-readable label: "iGPU", "dGPU", or "" for single-GPU hosts.
     pub label: String,
-    pub provider: String,
+    pub provider: GpuProvider,
     pub gpu_usage: f64,   // 0 - 100 %
     pub mem_used: u64,    // bytes
     pub mem_total: u64,   // bytes
@@ -40,7 +40,7 @@ pub struct GpuConfig {
     pub bar: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum GpuProvider {
     Amd,

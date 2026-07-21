@@ -5,6 +5,8 @@ use std::time::Duration;
 use tokio::sync::watch;
 use tracing::debug;
 
+use crate::util::read_trimmed;
+
 const POLL_INTERVAL: Duration = Duration::from_secs(30);
 const POWER_SUPPLY_DIR: &str = "/sys/class/power_supply";
 
@@ -20,7 +22,9 @@ pub struct BatteryState {
 
 pub async fn run(tx: watch::Sender<BatteryState>) -> Result<()> {
     loop {
-        let state = read_battery();
+        let state = tokio::task::spawn_blocking(read_battery)
+            .await
+            .unwrap_or_default();
         tx.send_if_modified(|current| {
             if *current != state {
                 debug!(
@@ -52,15 +56,15 @@ fn read_battery_from(dir: &Path) -> BatteryState {
 
     for entry in entries.flatten() {
         let path = entry.path();
-        let kind = read_trimmed(&path.join("type"));
+        let kind = read_trimmed(path.join("type"));
         match kind.as_deref() {
             Some("Battery") => {
                 // Skip peripheral batteries (wireless mice, controllers) which
                 // report scope "Device"; only the system battery gates dimming.
-                if read_trimmed(&path.join("scope")).as_deref() == Some("Device") {
+                if read_trimmed(path.join("scope")).as_deref() == Some("Device") {
                     continue;
                 }
-                if let Some(capacity) = read_trimmed(&path.join("capacity"))
+                if let Some(capacity) = read_trimmed(path.join("capacity"))
                     .and_then(|v| v.parse::<f64>().ok())
                 {
                     state.present = true;
@@ -68,7 +72,7 @@ fn read_battery_from(dir: &Path) -> BatteryState {
                 }
             }
             // Mains / USB / Wireless power delivery all count as AC.
-            Some(_) if read_trimmed(&path.join("online")).as_deref() == Some("1") => {
+            Some(_) if read_trimmed(path.join("online")).as_deref() == Some("1") => {
                 state.on_ac = true;
             }
             _ => {}
@@ -76,12 +80,6 @@ fn read_battery_from(dir: &Path) -> BatteryState {
     }
 
     state
-}
-
-fn read_trimmed(path: &Path) -> Option<String> {
-    std::fs::read_to_string(path)
-        .ok()
-        .map(|s| s.trim().to_string())
 }
 
 #[cfg(test)]
