@@ -2,6 +2,8 @@ pub mod amd;
 pub mod intel;
 pub mod nvidia;
 
+pub(crate) mod model;
+
 use serde::{Deserialize, Serialize};
 
 use crate::sensors::SensorSpec;
@@ -16,6 +18,13 @@ pub struct GpuInfo {
     pub id: String,
     /// Human-readable label: "iGPU", "dGPU", or "" for single-GPU hosts.
     pub label: String,
+    /// Marketing model name, e.g. "Radeon RX 7800 XT". The vendor is stripped
+    /// (it is carried by `provider`); falls back to the PCI address when no PCI
+    /// database entry matches. Resolved by [`model::resolve`]. `serde(default)`
+    /// keeps it backward-compatible when deserializing data from a producer
+    /// predating this field (e.g. across an IPC-boundary rolling upgrade).
+    #[serde(default)]
+    pub model: String,
     pub provider: GpuProvider,
     pub gpu_usage: f64,   // 0 - 100 %
     pub mem_used: u64,    // bytes

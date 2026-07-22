@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::watch;
 use tracing::debug;
 
-use crate::gpu::{GpuConfig, GpuInfo, GpuProvider, GpuState};
+use crate::gpu::{GpuConfig, GpuInfo, GpuProvider, GpuState, model};
 
 /// Reads Intel iGPU usage from the DRM `fdinfo` interface (the same source
 /// `intel_gpu_top`/`nvtop` use). i915 has no `gpu_busy_percent` file like
@@ -25,6 +25,8 @@ pub async fn run(tx: watch::Sender<GpuState>, configs: Vec<GpuConfig>, poll_ms: 
         std::future::pending::<()>().await;
         return Ok(());
     }
+
+    let models = model::resolve_all(configs.iter().map(|c| (c.id.as_str(), c.provider)));
 
     let interval = Duration::from_millis(poll_ms);
     // Per PCI id, per DRM client-id: last-seen cumulative render-busy ns.
@@ -67,6 +69,7 @@ pub async fn run(tx: watch::Sender<GpuState>, configs: Vec<GpuConfig>, poll_ms: 
             gpus.push(GpuInfo {
                 id: cfg.id.clone(),
                 label: "iGPU".to_string(),
+                model: models.get(&cfg.id).cloned().unwrap_or_else(|| cfg.id.clone()),
                 provider: GpuProvider::Intel,
                 gpu_usage,
                 mem_used: 0,

@@ -6,7 +6,7 @@ use std::time::Duration;
 use tokio::sync::watch;
 use tracing::{debug, warn};
 
-use crate::gpu::{GpuConfig, GpuInfo, GpuProvider, GpuState};
+use crate::gpu::{GpuConfig, GpuInfo, GpuProvider, GpuState, model};
 use crate::util::read_trimmed;
 
 /// Scan `/sys/bus/pci/devices/` and return all PCI IDs that expose an `amdgpu`
@@ -78,13 +78,17 @@ pub async fn run(
         configs
     };
 
+    let models = Arc::new(model::resolve_all(
+        resolved.iter().map(|c| (c.id.as_str(), c.provider)),
+    ));
     let resolved = Arc::new(resolved);
     let vk_types = Arc::new(vk_types);
     let interval = Duration::from_millis(poll_ms);
     loop {
         let configs = Arc::clone(&resolved);
         let vk = Arc::clone(&vk_types);
-        let state = tokio::task::spawn_blocking(move || read_state(&configs, &vk))
+        let mdl = Arc::clone(&models);
+        let state = tokio::task::spawn_blocking(move || read_state(&configs, &vk, &mdl))
             .await
             .unwrap_or_default();
         tx.send_replace(state);
@@ -92,7 +96,11 @@ pub async fn run(
     }
 }
 
-fn read_state(configs: &[GpuConfig], vk_types: &HashMap<u32, bool>) -> GpuState {
+fn read_state(
+    configs: &[GpuConfig],
+    vk_types: &HashMap<u32, bool>,
+    models: &HashMap<String, String>,
+) -> GpuState {
     let mut gpus = Vec::new();
 
     for cfg in configs {
@@ -140,6 +148,7 @@ fn read_state(configs: &[GpuConfig], vk_types: &HashMap<u32, bool>) -> GpuState 
         gpus.push(GpuInfo {
             id: id.clone(),
             label,
+            model: models.get(id).cloned().unwrap_or_else(|| id.clone()),
             provider: GpuProvider::Amd,
             gpu_usage,
             mem_used,
