@@ -13,8 +13,16 @@ use std::path::Path;
 use crate::gpu::GpuProvider;
 use crate::util::read_trimmed;
 
-const AMDGPU_IDS_PATH: &str = "/usr/share/libdrm/amdgpu.ids";
-const PCI_IDS_PATH: &str = "/usr/share/hwdata/pci.ids";
+// Nix-based distros have no /usr/share; libdrm/hwdata live in the Nix store and
+// are only reachable system-wide via the activated system profile.
+const AMDGPU_IDS_CANDIDATES: &[&str] = &[
+    "/usr/share/libdrm/amdgpu.ids",
+    "/run/current-system/sw/share/libdrm/amdgpu.ids",
+];
+const PCI_IDS_CANDIDATES: &[&str] = &[
+    "/usr/share/hwdata/pci.ids",
+    "/run/current-system/sw/share/hwdata/pci.ids",
+];
 
 /// Best-effort display name for the GPU at `pci_id` (a sysfs BDF such as
 /// `0000:03:00.0`). Never empty: falls back to `pci_id` when no database entry
@@ -40,15 +48,22 @@ fn lookup(pci_id: &str, provider: GpuProvider) -> Option<String> {
 
     if provider == GpuProvider::Amd
         && let Some(revision) = read_hex(dir.join("revision"))
-        && let Ok(content) = std::fs::read_to_string(AMDGPU_IDS_PATH)
+        && let Some(content) = read_first_existing(AMDGPU_IDS_CANDIDATES)
         && let Some(name) = parse_amdgpu_ids(&content, device_id, revision)
     {
         return Some(name);
     }
 
     let vendor_id = read_hex(dir.join("vendor"))?;
-    let content = std::fs::read_to_string(PCI_IDS_PATH).ok()?;
+    let content = read_first_existing(PCI_IDS_CANDIDATES)?;
     parse_pci_ids(&content, vendor_id, device_id)
+}
+
+/// Read the first of `paths` that exists, in order.
+fn read_first_existing(paths: &[&str]) -> Option<String> {
+    paths
+        .iter()
+        .find_map(|path| std::fs::read_to_string(path).ok())
 }
 
 /// Parse a `0x`-prefixed hex value from a sysfs file (e.g. `vendor`/`device`).
@@ -103,7 +118,9 @@ fn parse_pci_ids(content: &str, vendor_id: u32, device_id: u32) -> Option<String
             if in_vendor {
                 return None;
             }
-            in_vendor = line.split_once("  ").is_some_and(|(id, _)| id == vendor_hex);
+            in_vendor = line
+                .split_once("  ")
+                .is_some_and(|(id, _)| id == vendor_hex);
             continue;
         }
         if !in_vendor || line.starts_with("\t\t") {

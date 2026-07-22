@@ -6,10 +6,17 @@ use tracing::debug;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CpuState {
+    /// Marketing model name, e.g. "AMD Ryzen Embedded V1605B", read once at
+    /// startup since it never changes at runtime. `serde(default)` keeps it
+    /// backward-compatible when deserializing data from a producer predating
+    /// this field.
+    #[serde(default)]
+    pub model: String,
     pub usage: f64, // 0.0 - 100.0
 }
 
 pub async fn run(tx: watch::Sender<CpuState>) -> Result<()> {
+    let model = read_model().await.unwrap_or_default();
     let mut prev = read_stat().await.unwrap_or_default();
 
     loop {
@@ -27,6 +34,7 @@ pub async fn run(tx: watch::Sender<CpuState>) -> Result<()> {
 
             debug!("CPU usage: {usage:.1}%");
             tx.send_replace(CpuState {
+                model: model.clone(),
                 usage: usage.clamp(0.0, 100.0),
             });
             prev = curr;
@@ -86,6 +94,42 @@ fn parse_stat(content: &str) -> Option<CpuTimes> {
     })
 }
 
+async fn read_model() -> Option<String> {
+    tokio::task::spawn_blocking(|| {
+        let content = std::fs::read_to_string("/proc/cpuinfo").ok()?;
+        parse_model(&content)
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+fn parse_model(content: &str) -> Option<String> {
+    let raw = content
+        .lines()
+        .find_map(|line| line.strip_prefix("model name"))?
+        .trim_start_matches([':', '\t', ' ']);
+    Some(clean_model_name(raw))
+}
+
+/// Strip noise `/proc/cpuinfo` bakes into the "model name" field: registered
+/// trademark markers, Intel's trailing clock-speed ("... CPU @ 3.60GHz"), and
+/// AMD APUs advertising their integrated GPU ("... with Radeon Vega Gfx").
+fn clean_model_name(raw: &str) -> String {
+    let mut name = raw.trim();
+    if let Some(idx) = name.find(" with Radeon") {
+        name = &name[..idx];
+    }
+    if let Some(idx) = name.find(" CPU @") {
+        name = &name[..idx];
+    }
+    name.replace("(R)", "")
+        .replace("(TM)", "")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -117,5 +161,42 @@ mod tests {
         let idle_delta = curr.idle - prev.idle;
         let usage = (1.0 - idle_delta as f64 / total_delta as f64) * 100.0;
         assert_eq!(usage, 50.0);
+    }
+
+    #[test]
+    fn parses_model_name_from_cpuinfo() {
+        let content = "processor\t: 0\nmodel name\t: AMD Ryzen Embedded V1605B with Radeon Vega Gfx\ncpu MHz\t: 2000.0\n";
+        assert_eq!(
+            parse_model(content).as_deref(),
+            Some("AMD Ryzen Embedded V1605B"),
+        );
+    }
+
+    #[test]
+    fn strips_radeon_gpu_suffix() {
+        assert_eq!(
+            clean_model_name("AMD Ryzen Embedded V1605B with Radeon Vega Gfx"),
+            "AMD Ryzen Embedded V1605B",
+        );
+        assert_eq!(
+            clean_model_name("AMD Ryzen 7 5700G with Radeon Graphics"),
+            "AMD Ryzen 7 5700G",
+        );
+    }
+
+    #[test]
+    fn strips_intel_clock_speed_and_trademark_markers() {
+        assert_eq!(
+            clean_model_name("Intel(R) Core(TM) i7-9700K CPU @ 3.60GHz"),
+            "Intel Core i7-9700K",
+        );
+    }
+
+    #[test]
+    fn leaves_plain_model_names_untouched() {
+        assert_eq!(
+            clean_model_name("AMD Ryzen 9 7950X3D"),
+            "AMD Ryzen 9 7950X3D",
+        );
     }
 }
