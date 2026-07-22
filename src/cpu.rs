@@ -4,19 +4,25 @@ use std::time::Duration;
 use tokio::sync::watch;
 use tracing::debug;
 
+/// A logical CPU's marketing model name. Kept per-core rather than collapsed
+/// into one string because hybrid/heterogeneous SoCs (ARM big.LITTLE, Intel
+/// P-core/E-core) genuinely have more than one CPU model in the same box.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct CoreModel {
+    pub cpu: u32,
+    pub model: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CpuState {
-    /// Marketing model name, e.g. "AMD Ryzen Embedded V1605B", read once at
-    /// startup since it never changes at runtime. `serde(default)` keeps it
-    /// backward-compatible when deserializing data from a producer predating
-    /// this field.
-    #[serde(default)]
-    pub model: String,
+    /// Per-core marketing model names, read once at startup since they never
+    /// change at runtime.
+    pub models: Vec<CoreModel>,
     pub usage: f64, // 0.0 - 100.0
 }
 
 pub async fn run(tx: watch::Sender<CpuState>) -> Result<()> {
-    let model = resolve_model().await.unwrap_or_default();
+    let models = resolve_models().await;
     let mut prev = read_stat().await.unwrap_or_default();
 
     loop {
@@ -34,7 +40,7 @@ pub async fn run(tx: watch::Sender<CpuState>) -> Result<()> {
 
             debug!("CPU usage: {usage:.1}%");
             tx.send_replace(CpuState {
-                model: model.clone(),
+                models: models.clone(),
                 usage: usage.clamp(0.0, 100.0),
             });
             prev = curr;
@@ -94,65 +100,101 @@ fn parse_stat(content: &str) -> Option<CpuTimes> {
     })
 }
 
-/// Best-effort marketing CPU model name, e.g. "AMD Ryzen Embedded V1605B" or
-/// "ARM Cortex-A72". Never changes at runtime, so callers should resolve it
-/// once at startup rather than on every poll tick.
-pub async fn resolve_model() -> Option<String> {
-    if let Some(model) = read_model_from_cpuinfo().await {
-        return Some(model);
+/// Best-effort per-core marketing CPU model names, e.g. `{0: "AMD Ryzen
+/// Embedded V1605B"}` or, on a hybrid ARM SoC, `{0: "Cortex-A55", 1:
+/// "Cortex-A55", 2: "Cortex-A76", 3: "Cortex-A76"}`. Never changes at
+/// runtime, so callers should resolve it once at startup rather than on
+/// every poll tick.
+pub async fn resolve_models() -> Vec<CoreModel> {
+    let from_cpuinfo = read_models_from_cpuinfo().await;
+    if !from_cpuinfo.is_empty() {
+        return from_cpuinfo;
     }
-    read_model_from_lscpu().await
+    read_models_from_lscpu().await
 }
 
-async fn read_model_from_cpuinfo() -> Option<String> {
+async fn read_models_from_cpuinfo() -> Vec<CoreModel> {
     tokio::task::spawn_blocking(|| {
         let content = std::fs::read_to_string("/proc/cpuinfo").ok()?;
-        parse_model(&content)
+        Some(parse_cpuinfo_models(&content))
     })
     .await
     .ok()
     .flatten()
+    .unwrap_or_default()
 }
 
-fn parse_model(content: &str) -> Option<String> {
-    let raw = content
-        .lines()
-        .find_map(|line| line.strip_prefix("model name"))?
-        .trim_start_matches([':', '\t', ' ']);
-    Some(clean_model_name(raw))
+/// `/proc/cpuinfo` lists one block per logical CPU, separated by a blank
+/// line; each block carries its own "processor" index and "model name" (x86
+/// only - ARM has no such field, see `read_models_from_lscpu`).
+fn parse_cpuinfo_models(content: &str) -> Vec<CoreModel> {
+    let mut result = Vec::new();
+    let mut cpu: Option<u32> = None;
+    let mut model: Option<String> = None;
+
+    for line in content.lines() {
+        if line.is_empty() {
+            if let (Some(cpu), Some(model)) = (cpu.take(), model.take()) {
+                result.push(CoreModel {
+                    cpu,
+                    model: clean_model_name(&model),
+                });
+            }
+            continue;
+        }
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        match key.trim() {
+            "processor" => cpu = value.trim().parse().ok(),
+            "model name" => model = Some(value.trim().to_string()),
+            _ => {}
+        }
+    }
+    if let (Some(cpu), Some(model)) = (cpu, model) {
+        result.push(CoreModel {
+            cpu,
+            model: clean_model_name(&model),
+        });
+    }
+
+    result
 }
 
 /// ARM `/proc/cpuinfo` (e.g. on Raspberry Pi) has no "model name" line, only
 /// per-core implementer/part IDs (e.g. `0x41`/`0xd08`) that need a database to
-/// resolve to something readable ("Cortex-A72"). `lscpu` already ships that
-/// database, so shell out to it rather than embedding one.
-async fn read_model_from_lscpu() -> Option<String> {
-    let output = tokio::process::Command::new("lscpu")
-        .arg("-J")
+/// resolve to something readable ("Cortex-A72"). `lscpu`'s extended,
+/// per-logical-CPU format already ships that database and - unlike its
+/// summary view - reports each core's own model, which is what correctly
+/// identifies heterogeneous (big.LITTLE-style) SoCs.
+async fn read_models_from_lscpu() -> Vec<CoreModel> {
+    let Ok(output) = tokio::process::Command::new("lscpu")
+        .args(["-e=cpu,MODELNAME", "--json"])
         .output()
         .await
-        .ok()?;
-    let json: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
-    parse_lscpu_model(&json)
+    else {
+        return Vec::new();
+    };
+    let Ok(json) = serde_json::from_slice::<serde_json::Value>(&output.stdout) else {
+        return Vec::new();
+    };
+    parse_lscpu_extended_models(&json)
 }
 
-fn parse_lscpu_model(json: &serde_json::Value) -> Option<String> {
-    let fields = json.get("lscpu")?.as_array()?;
-    let field = |name: &str| {
-        fields.iter().find_map(|f| {
-            (f.get("field")?.as_str()? == name)
-                .then(|| f.get("data")?.as_str().map(str::to_string))
-                .flatten()
-        })
+fn parse_lscpu_extended_models(json: &serde_json::Value) -> Vec<CoreModel> {
+    let Some(cpus) = json.get("cpus").and_then(|v| v.as_array()) else {
+        return Vec::new();
     };
-
-    let model = field("Model name:")?;
-    match field("Vendor ID:") {
-        Some(vendor) if !model.to_lowercase().contains(&vendor.to_lowercase()) => {
-            Some(format!("{vendor} {model}"))
-        }
-        _ => Some(model),
-    }
+    cpus.iter()
+        .filter_map(|entry| {
+            let cpu = entry.get("cpu")?.as_u64()? as u32;
+            let model = entry.get("modelname")?.as_str()?;
+            Some(CoreModel {
+                cpu,
+                model: clean_model_name(model),
+            })
+        })
+        .collect()
 }
 
 /// Strip noise `/proc/cpuinfo` bakes into the "model name" field: registered
@@ -218,57 +260,138 @@ mod tests {
     }
 
     #[test]
-    fn parses_model_name_from_cpuinfo() {
-        let content = "processor\t: 0\nmodel name\t: AMD Ryzen Embedded V1605B with Radeon Vega Gfx\ncpu MHz\t: 2000.0\n";
+    fn parses_per_core_model_from_cpuinfo() {
+        let content = "processor\t: 0\n\
+            model name\t: AMD Ryzen Embedded V1605B with Radeon Vega Gfx\n\
+            cpu MHz\t: 2000.0\n\
+            \n\
+            processor\t: 1\n\
+            model name\t: AMD Ryzen Embedded V1605B with Radeon Vega Gfx\n\
+            cpu MHz\t: 2100.0\n";
         assert_eq!(
-            parse_model(content).as_deref(),
-            Some("AMD Ryzen Embedded V1605B"),
+            parse_cpuinfo_models(content),
+            vec![
+                CoreModel {
+                    cpu: 0,
+                    model: "AMD Ryzen Embedded V1605B".to_string()
+                },
+                CoreModel {
+                    cpu: 1,
+                    model: "AMD Ryzen Embedded V1605B".to_string()
+                },
+            ],
         );
     }
 
     #[test]
-    fn returns_none_for_arm_cpuinfo_without_model_name() {
+    fn parses_heterogeneous_cores_from_cpuinfo() {
+        // Distinct "model name" values per core, e.g. an Intel P-core/E-core
+        // split, must not collapse into a single reported model.
+        let content = "processor\t: 0\nmodel name\t: Intel P-Core\n\
+            \n\
+            processor\t: 1\nmodel name\t: Intel E-Core\n";
+        assert_eq!(
+            parse_cpuinfo_models(content),
+            vec![
+                CoreModel {
+                    cpu: 0,
+                    model: "Intel P-Core".to_string()
+                },
+                CoreModel {
+                    cpu: 1,
+                    model: "Intel E-Core".to_string()
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn returns_empty_for_arm_cpuinfo_without_model_name() {
         let content = "processor\t: 0\nBogoMIPS\t: 108.00\nCPU implementer\t: 0x41\nCPU part\t: 0xd08\n";
-        assert_eq!(parse_model(content), None);
+        assert_eq!(parse_cpuinfo_models(content), Vec::new());
     }
 
     #[test]
-    fn parses_model_name_from_lscpu_json() {
+    fn parses_per_core_models_from_lscpu_extended_json() {
         let json = serde_json::json!({
-            "lscpu": [
-                {"field": "Architecture:", "data": "aarch64"},
-                {"field": "Vendor ID:", "data": "ARM"},
-                {"field": "Model name:", "data": "Cortex-A72"},
+            "cpus": [
+                {"cpu": 0, "modelname": "Cortex-A72"},
+                {"cpu": 1, "modelname": "Cortex-A72"},
             ]
         });
         assert_eq!(
-            parse_lscpu_model(&json).as_deref(),
-            Some("ARM Cortex-A72"),
+            parse_lscpu_extended_models(&json),
+            vec![
+                CoreModel {
+                    cpu: 0,
+                    model: "Cortex-A72".to_string()
+                },
+                CoreModel {
+                    cpu: 1,
+                    model: "Cortex-A72".to_string()
+                },
+            ],
         );
     }
 
     #[test]
-    fn lscpu_model_not_prefixed_when_already_contains_vendor() {
+    fn parses_heterogeneous_cores_from_lscpu_extended_json() {
+        // A big.LITTLE SoC (e.g. RK3588's 4x A55 + 4x A76) reports a distinct
+        // model per cpu row; each core's own model must survive, not just
+        // the first one seen.
         let json = serde_json::json!({
-            "lscpu": [
-                {"field": "Vendor ID:", "data": "Qualcomm"},
-                {"field": "Model name:", "data": "Qualcomm Kryo"},
+            "cpus": [
+                {"cpu": 0, "modelname": "Cortex-A55"},
+                {"cpu": 1, "modelname": "Cortex-A55"},
+                {"cpu": 2, "modelname": "Cortex-A76"},
+                {"cpu": 3, "modelname": "Cortex-A76"},
             ]
         });
         assert_eq!(
-            parse_lscpu_model(&json).as_deref(),
-            Some("Qualcomm Kryo"),
+            parse_lscpu_extended_models(&json),
+            vec![
+                CoreModel {
+                    cpu: 0,
+                    model: "Cortex-A55".to_string()
+                },
+                CoreModel {
+                    cpu: 1,
+                    model: "Cortex-A55".to_string()
+                },
+                CoreModel {
+                    cpu: 2,
+                    model: "Cortex-A76".to_string()
+                },
+                CoreModel {
+                    cpu: 3,
+                    model: "Cortex-A76".to_string()
+                },
+            ],
         );
     }
 
     #[test]
-    fn lscpu_model_none_without_model_name_field() {
+    fn lscpu_extended_models_cleans_raw_names() {
         let json = serde_json::json!({
-            "lscpu": [
-                {"field": "Vendor ID:", "data": "ARM"},
+            "cpus": [
+                {"cpu": 0, "modelname": "AMD Ryzen 9 7900 12-Core Processor"},
             ]
         });
-        assert_eq!(parse_lscpu_model(&json), None);
+        assert_eq!(
+            parse_lscpu_extended_models(&json),
+            vec![CoreModel {
+                cpu: 0,
+                model: "AMD Ryzen 9 7900".to_string()
+            }],
+        );
+    }
+
+    #[test]
+    fn lscpu_extended_models_empty_without_cpus_field() {
+        assert_eq!(
+            parse_lscpu_extended_models(&serde_json::json!({})),
+            Vec::new(),
+        );
     }
 
     #[test]
