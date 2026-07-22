@@ -95,6 +95,13 @@ fn parse_stat(content: &str) -> Option<CpuTimes> {
 }
 
 async fn read_model() -> Option<String> {
+    if let Some(model) = read_model_from_cpuinfo().await {
+        return Some(model);
+    }
+    read_model_from_lscpu().await
+}
+
+async fn read_model_from_cpuinfo() -> Option<String> {
     tokio::task::spawn_blocking(|| {
         let content = std::fs::read_to_string("/proc/cpuinfo").ok()?;
         parse_model(&content)
@@ -110,6 +117,39 @@ fn parse_model(content: &str) -> Option<String> {
         .find_map(|line| line.strip_prefix("model name"))?
         .trim_start_matches([':', '\t', ' ']);
     Some(clean_model_name(raw))
+}
+
+/// ARM `/proc/cpuinfo` (e.g. on Raspberry Pi) has no "model name" line, only
+/// per-core implementer/part IDs (e.g. `0x41`/`0xd08`) that need a database to
+/// resolve to something readable ("Cortex-A72"). `lscpu` already ships that
+/// database, so shell out to it rather than embedding one.
+async fn read_model_from_lscpu() -> Option<String> {
+    let output = tokio::process::Command::new("lscpu")
+        .arg("-J")
+        .output()
+        .await
+        .ok()?;
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    parse_lscpu_model(&json)
+}
+
+fn parse_lscpu_model(json: &serde_json::Value) -> Option<String> {
+    let fields = json.get("lscpu")?.as_array()?;
+    let field = |name: &str| {
+        fields.iter().find_map(|f| {
+            (f.get("field")?.as_str()? == name)
+                .then(|| f.get("data")?.as_str().map(str::to_string))
+                .flatten()
+        })
+    };
+
+    let model = field("Model name:")?;
+    match field("Vendor ID:") {
+        Some(vendor) if !model.to_lowercase().contains(&vendor.to_lowercase()) => {
+            Some(format!("{vendor} {model}"))
+        }
+        _ => Some(model),
+    }
 }
 
 /// Strip noise `/proc/cpuinfo` bakes into the "model name" field: registered
@@ -170,6 +210,51 @@ mod tests {
             parse_model(content).as_deref(),
             Some("AMD Ryzen Embedded V1605B"),
         );
+    }
+
+    #[test]
+    fn returns_none_for_arm_cpuinfo_without_model_name() {
+        let content = "processor\t: 0\nBogoMIPS\t: 108.00\nCPU implementer\t: 0x41\nCPU part\t: 0xd08\n";
+        assert_eq!(parse_model(content), None);
+    }
+
+    #[test]
+    fn parses_model_name_from_lscpu_json() {
+        let json = serde_json::json!({
+            "lscpu": [
+                {"field": "Architecture:", "data": "aarch64"},
+                {"field": "Vendor ID:", "data": "ARM"},
+                {"field": "Model name:", "data": "Cortex-A72"},
+            ]
+        });
+        assert_eq!(
+            parse_lscpu_model(&json).as_deref(),
+            Some("ARM Cortex-A72"),
+        );
+    }
+
+    #[test]
+    fn lscpu_model_not_prefixed_when_already_contains_vendor() {
+        let json = serde_json::json!({
+            "lscpu": [
+                {"field": "Vendor ID:", "data": "Qualcomm"},
+                {"field": "Model name:", "data": "Qualcomm Kryo"},
+            ]
+        });
+        assert_eq!(
+            parse_lscpu_model(&json).as_deref(),
+            Some("Qualcomm Kryo"),
+        );
+    }
+
+    #[test]
+    fn lscpu_model_none_without_model_name_field() {
+        let json = serde_json::json!({
+            "lscpu": [
+                {"field": "Vendor ID:", "data": "ARM"},
+            ]
+        });
+        assert_eq!(parse_lscpu_model(&json), None);
     }
 
     #[test]
