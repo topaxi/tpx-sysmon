@@ -16,7 +16,7 @@ pub struct CpuState {
 }
 
 pub async fn run(tx: watch::Sender<CpuState>) -> Result<()> {
-    let model = read_model().await.unwrap_or_default();
+    let model = resolve_model().await.unwrap_or_default();
     let mut prev = read_stat().await.unwrap_or_default();
 
     loop {
@@ -94,7 +94,10 @@ fn parse_stat(content: &str) -> Option<CpuTimes> {
     })
 }
 
-async fn read_model() -> Option<String> {
+/// Best-effort marketing CPU model name, e.g. "AMD Ryzen Embedded V1605B" or
+/// "ARM Cortex-A72". Never changes at runtime, so callers should resolve it
+/// once at startup rather than on every poll tick.
+pub async fn resolve_model() -> Option<String> {
     if let Some(model) = read_model_from_cpuinfo().await {
         return Some(model);
     }
@@ -153,8 +156,9 @@ fn parse_lscpu_model(json: &serde_json::Value) -> Option<String> {
 }
 
 /// Strip noise `/proc/cpuinfo` bakes into the "model name" field: registered
-/// trademark markers, Intel's trailing clock-speed ("... CPU @ 3.60GHz"), and
-/// AMD APUs advertising their integrated GPU ("... with Radeon Vega Gfx").
+/// trademark markers, Intel's trailing clock-speed ("... CPU @ 3.60GHz"), AMD
+/// APUs advertising their integrated GPU ("... with Radeon Vega Gfx"), and
+/// AMD's trailing core-count marketing suffix ("... 12-Core Processor").
 fn clean_model_name(raw: &str) -> String {
     let mut name = raw.trim();
     if let Some(idx) = name.find(" with Radeon") {
@@ -163,11 +167,21 @@ fn clean_model_name(raw: &str) -> String {
     if let Some(idx) = name.find(" CPU @") {
         name = &name[..idx];
     }
-    name.replace("(R)", "")
-        .replace("(TM)", "")
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
+    let cleaned = name.replace("(R)", "").replace("(TM)", "");
+    let mut words: Vec<&str> = cleaned.split_whitespace().collect();
+    if words.last() == Some(&"Processor")
+        && words.len() >= 2
+        && is_core_count(words[words.len() - 2])
+    {
+        words.truncate(words.len() - 2);
+    }
+    words.join(" ")
+}
+
+/// True for tokens like `12-Core` - a bare digit count followed by `-Core`.
+fn is_core_count(word: &str) -> bool {
+    word.strip_suffix("-Core")
+        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
 }
 
 #[cfg(test)]
@@ -266,6 +280,22 @@ mod tests {
         assert_eq!(
             clean_model_name("AMD Ryzen 7 5700G with Radeon Graphics"),
             "AMD Ryzen 7 5700G",
+        );
+    }
+
+    #[test]
+    fn strips_amd_core_count_suffix() {
+        assert_eq!(
+            clean_model_name("AMD Ryzen 9 7900 12-Core Processor"),
+            "AMD Ryzen 9 7900",
+        );
+    }
+
+    #[test]
+    fn leaves_processor_suffix_without_core_count_untouched() {
+        assert_eq!(
+            clean_model_name("Some Weird Processor"),
+            "Some Weird Processor",
         );
     }
 
