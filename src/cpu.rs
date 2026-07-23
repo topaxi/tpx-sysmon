@@ -1,5 +1,6 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::time::Duration;
 use tokio::sync::watch;
 use tracing::debug;
@@ -226,6 +227,50 @@ fn is_core_count(word: &str) -> bool {
         .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
 }
 
+/// Reads `cpu MHz` per logical processor index from `/proc/cpuinfo`,
+/// matching what Node's `os.cpus()[].speed` reports. Unlike the model name,
+/// current clock speed genuinely varies per core (frequency scaling), so
+/// callers should re-read this every tick rather than caching it like
+/// `resolve_models`.
+pub fn read_cpuinfo_speeds() -> HashMap<u32, u32> {
+    let Ok(content) = std::fs::read_to_string("/proc/cpuinfo") else {
+        return HashMap::new();
+    };
+    parse_cpuinfo_speeds(&content)
+}
+
+fn parse_cpuinfo_speeds(content: &str) -> HashMap<u32, u32> {
+    let mut result = HashMap::new();
+    let mut current_idx: Option<u32> = None;
+    let mut current_mhz: Option<f64> = None;
+
+    for line in content.lines() {
+        if line.is_empty() {
+            if let (Some(idx), Some(mhz)) = (current_idx.take(), current_mhz.take()) {
+                result.insert(idx, mhz.round() as u32);
+            }
+            continue;
+        }
+
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let key = key.trim();
+        let value = value.trim();
+
+        match key {
+            "processor" => current_idx = value.parse().ok(),
+            "cpu MHz" => current_mhz = value.parse().ok(),
+            _ => {}
+        }
+    }
+    if let (Some(idx), Some(mhz)) = (current_idx, current_mhz) {
+        result.insert(idx, mhz.round() as u32);
+    }
+
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -436,5 +481,31 @@ mod tests {
             clean_model_name("AMD Ryzen 9 7950X3D"),
             "AMD Ryzen 9 7950X3D",
         );
+    }
+
+    #[test]
+    fn parses_per_core_speeds_from_cpuinfo() {
+        let content = "processor\t: 0\n\
+            model name\t: AMD Ryzen Embedded V1605B\n\
+            cpu MHz\t: 2000.0\n\
+            \n\
+            processor\t: 1\n\
+            model name\t: AMD Ryzen Embedded V1605B\n\
+            cpu MHz\t: 2100.0\n";
+        let speeds = parse_cpuinfo_speeds(content);
+        assert_eq!(speeds.get(&0), Some(&2000));
+        assert_eq!(speeds.get(&1), Some(&2100));
+    }
+
+    #[test]
+    fn rounds_fractional_mhz() {
+        let content = "processor\t: 0\ncpu MHz\t: 2399.6\n";
+        assert_eq!(parse_cpuinfo_speeds(content).get(&0), Some(&2400));
+    }
+
+    #[test]
+    fn empty_without_cpu_mhz_field() {
+        let content = "processor\t: 0\nBogoMIPS\t: 108.00\n";
+        assert!(parse_cpuinfo_speeds(content).is_empty());
     }
 }
