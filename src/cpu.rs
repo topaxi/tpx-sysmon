@@ -227,12 +227,25 @@ fn is_core_count(word: &str) -> bool {
         .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
 }
 
-/// Reads `cpu MHz` per logical processor index from `/proc/cpuinfo`,
-/// matching what Node's `os.cpus()[].speed` reports. Unlike the model name,
-/// current clock speed genuinely varies per core (frequency scaling), so
-/// callers should re-read this every tick rather than caching it like
+/// Best-effort per-core current clock speed in MHz, keyed by logical CPU
+/// index, matching what Node's `os.cpus()[].speed` reports. Unlike the model
+/// name, current clock speed genuinely varies per core (frequency scaling),
+/// so callers should re-read this every tick rather than caching it like
 /// `resolve_models`.
-pub fn read_cpuinfo_speeds() -> HashMap<u32, u32> {
+///
+/// Prefers `/proc/cpuinfo`'s `cpu MHz` field (x86); ARM's `/proc/cpuinfo`
+/// (e.g. Raspberry Pi) carries no such field at all, so this falls back to
+/// sysfs `cpufreq/scaling_cur_freq` - the same source `lscpu` itself reads
+/// for its `CPU max/min MHz` output.
+pub fn read_speeds() -> HashMap<u32, u32> {
+    let from_cpuinfo = read_cpuinfo_speeds();
+    if !from_cpuinfo.is_empty() {
+        return from_cpuinfo;
+    }
+    read_sysfs_speeds()
+}
+
+fn read_cpuinfo_speeds() -> HashMap<u32, u32> {
     let Ok(content) = std::fs::read_to_string("/proc/cpuinfo") else {
         return HashMap::new();
     };
@@ -269,6 +282,32 @@ fn parse_cpuinfo_speeds(content: &str) -> HashMap<u32, u32> {
     }
 
     result
+}
+
+/// Reads current clock speed via sysfs `cpufreq/scaling_cur_freq` (in kHz)
+/// for each `cpuN` directory under `/sys/devices/system/cpu/`. Used as the
+/// fallback when `/proc/cpuinfo` carries no `cpu MHz` field, e.g. ARM boards
+/// such as the Raspberry Pi. `scaling_cur_freq` is world-readable, unlike the
+/// root-only `cpuinfo_cur_freq` sibling file.
+fn read_sysfs_speeds() -> HashMap<u32, u32> {
+    let Ok(entries) = std::fs::read_dir("/sys/devices/system/cpu") else {
+        return HashMap::new();
+    };
+
+    entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            let idx: u32 = name.to_str()?.strip_prefix("cpu")?.parse().ok()?;
+            let khz_path = entry.path().join("cpufreq/scaling_cur_freq");
+            let khz: u64 = std::fs::read_to_string(khz_path).ok()?.trim().parse().ok()?;
+            Some((idx, khz_to_mhz(khz)))
+        })
+        .collect()
+}
+
+fn khz_to_mhz(khz: u64) -> u32 {
+    ((khz + 500) / 1000) as u32
 }
 
 #[cfg(test)]
@@ -507,5 +546,12 @@ mod tests {
     fn empty_without_cpu_mhz_field() {
         let content = "processor\t: 0\nBogoMIPS\t: 108.00\n";
         assert!(parse_cpuinfo_speeds(content).is_empty());
+    }
+
+    #[test]
+    fn khz_to_mhz_rounds_to_nearest() {
+        assert_eq!(khz_to_mhz(1_500_000), 1500);
+        assert_eq!(khz_to_mhz(2_399_600), 2400);
+        assert_eq!(khz_to_mhz(600_000), 600);
     }
 }
