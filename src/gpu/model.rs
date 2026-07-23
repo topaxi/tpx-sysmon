@@ -75,7 +75,9 @@ fn read_hex(path: impl AsRef<Path>) -> Option<u32> {
 /// Look up a marketing name in libdrm's `amdgpu.ids` by device id + revision.
 /// Lines are `DEVICE,\tREVISION,\tProduct Name` with uppercase hex ids; `#`
 /// comments and the leading version line are ignored. Any redundant leading
-/// "AMD " is stripped since the vendor is conveyed separately.
+/// "AMD " is stripped since the vendor is conveyed separately. Some APU
+/// entries name the host CPU too (e.g. "Ryzen Embedded V1605B with Radeon
+/// Vega Gfx") - only the GPU part after "with" is kept.
 fn parse_amdgpu_ids(content: &str, device_id: u32, revision: u32) -> Option<String> {
     for line in content.lines() {
         let line = line.trim();
@@ -93,7 +95,9 @@ fn parse_amdgpu_ids(content: &str, device_id: u32, revision: u32) -> Option<Stri
             && u32::from_str_radix(rev, 16).ok() == Some(revision)
         {
             let name = name.trim();
-            return Some(name.strip_prefix("AMD ").unwrap_or(name).to_string());
+            let name = name.strip_prefix("AMD ").unwrap_or(name);
+            let name = name.rsplit_once(" with ").map_or(name, |(_, gpu)| gpu);
+            return Some(name.to_string());
         }
     }
     None
@@ -146,6 +150,7 @@ mod tests {
         "747E,\tC8,\tAMD Radeon RX 7800 XT\n",
         "747E,\tFF,\tAMD Radeon RX 7700 XT\n",
         "164E,\tD8,\tAMD Radeon 610M\n",
+        "15DD,\t83,\tAMD Ryzen Embedded V1605B with Radeon Vega Gfx\n",
     );
 
     #[test]
@@ -157,6 +162,14 @@ mod tests {
         assert_eq!(
             parse_amdgpu_ids(AMDGPU_IDS_SAMPLE, 0x747e, 0xff).as_deref(),
             Some("Radeon RX 7700 XT"),
+        );
+    }
+
+    #[test]
+    fn amdgpu_ids_apu_entries_drop_the_host_cpu_name() {
+        assert_eq!(
+            parse_amdgpu_ids(AMDGPU_IDS_SAMPLE, 0x15dd, 0x83).as_deref(),
+            Some("Radeon Vega Gfx"),
         );
     }
 
