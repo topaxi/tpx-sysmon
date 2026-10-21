@@ -33,8 +33,8 @@ pub struct GpuInfo {
     pub gtt_total: u64,   // bytes; AMD only, 0 on other providers
     pub temperature: f64, // °C (junction/hotspot when available, else edge)
     pub power_watts: f64,
-    /// Whether to show this GPU in the bar widget.
-    pub in_bar: bool,
+    /// Whether this is a primary GPU (default: true).
+    pub primary: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -43,10 +43,10 @@ pub struct GpuConfig {
     pub provider: GpuProvider,
     /// hwmon sensor specs for this GPU's temperature readings.
     pub gpu_temp_sensors: Vec<SensorSpec>,
-    /// Whether to show this GPU in the bar widget (default: true).
-    /// Set to false for iGPUs that should appear in the popup only.
+    /// Whether this is a primary GPU (default: true).
+    /// Set to false for iGPUs, which are listed as secondary.
     #[serde(default = "default_true")]
-    pub bar: bool,
+    pub primary: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

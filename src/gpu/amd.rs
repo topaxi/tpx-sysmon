@@ -78,7 +78,7 @@ pub async fn run(
                     id,
                     provider: GpuProvider::Amd,
                     gpu_temp_sensors: vec![],
-                    bar: !integrated,
+                    primary: !integrated,
                 }
             })
             .collect()
@@ -139,7 +139,7 @@ fn read_state(
         let (temperature, power_watts) = read_hwmon(dir);
 
         // Read PCI device ID from sysfs and look it up in the Vulkan map.
-        // Falls back to the explicit `bar` config flag if Vulkan wasn't available.
+        // Falls back to the explicit `primary` config flag if Vulkan wasn't available.
         let pci_device_id = read_trimmed(dir.join("device"))
             .and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok());
         let label = if configs.len() <= 1 {
@@ -147,7 +147,7 @@ fn read_state(
         } else {
             let is_integrated = pci_device_id
                 .and_then(|id| vk_types.get(&id).copied())
-                .unwrap_or(!cfg.bar);
+                .unwrap_or(!cfg.primary);
             if is_integrated { "iGPU" } else { "dGPU" }.to_string()
         };
 
@@ -165,7 +165,7 @@ fn read_state(
             gtt_total,
             temperature,
             power_watts,
-            in_bar: cfg.bar,
+            primary: cfg.primary,
         });
     }
 
