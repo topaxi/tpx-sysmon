@@ -67,11 +67,19 @@ pub async fn run(
         debug!("Auto-discovered {} AMD GPU(s)", found.len());
         found
             .into_iter()
-            .map(|id| GpuConfig {
-                id,
-                provider: GpuProvider::Amd,
-                gpu_temp_sensors: vec![],
-                bar: true,
+            .map(|id| {
+                // Integrated GPUs are not promoted, matching hosts that
+                // configure them explicitly.
+                let integrated = read_trimmed(format!("/sys/bus/pci/devices/{id}/device"))
+                    .and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+                    .and_then(|dev| vk_types.get(&dev).copied())
+                    .unwrap_or(false);
+                GpuConfig {
+                    id,
+                    provider: GpuProvider::Amd,
+                    gpu_temp_sensors: vec![],
+                    bar: !integrated,
+                }
             })
             .collect()
     } else {
