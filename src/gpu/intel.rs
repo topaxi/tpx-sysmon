@@ -78,7 +78,7 @@ pub async fn run(tx: watch::Sender<GpuState>, configs: Vec<GpuConfig>, poll_ms: 
                 gtt_total: 0,
                 temperature: 0.0,
                 power_watts: 0.0,
-                primary: cfg.primary,
+                integrated: cfg.integrated,
             });
         }
 

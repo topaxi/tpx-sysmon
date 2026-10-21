@@ -85,7 +85,7 @@ fn parse_gpu_line(
         gtt_total: 0,
         temperature: parts[4].trim().parse::<f64>().unwrap_or(0.0),
         power_watts: parts[5].trim().parse::<f64>().unwrap_or(0.0),
-        primary: config.primary,
+        integrated: config.integrated,
     })
 }
 
@@ -98,7 +98,7 @@ mod tests {
             id: id.to_string(),
             provider: GpuProvider::Nvidia,
             gpu_temp_sensors: vec![],
-            primary: true,
+            integrated: false,
         }
     }
 

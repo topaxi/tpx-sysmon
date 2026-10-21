@@ -33,8 +33,8 @@ pub struct GpuInfo {
     pub gtt_total: u64,   // bytes; AMD only, 0 on other providers
     pub temperature: f64, // °C (junction/hotspot when available, else edge)
     pub power_watts: f64,
-    /// Whether this is a primary GPU (default: true).
-    pub primary: bool,
+    /// Whether this is an integrated GPU (as opposed to a discrete one).
+    pub integrated: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -43,10 +43,9 @@ pub struct GpuConfig {
     pub provider: GpuProvider,
     /// hwmon sensor specs for this GPU's temperature readings.
     pub gpu_temp_sensors: Vec<SensorSpec>,
-    /// Whether this is a primary GPU (default: true).
-    /// Set to false for iGPUs, which are listed as secondary.
-    #[serde(default = "default_true")]
-    pub primary: bool,
+    /// Whether this is an integrated GPU (default: false).
+    #[serde(default)]
+    pub integrated: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -55,8 +54,4 @@ pub enum GpuProvider {
     Amd,
     Nvidia,
     Intel,
-}
-
-fn default_true() -> bool {
-    true
 }
