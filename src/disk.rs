@@ -72,7 +72,9 @@ fn parse_mounts(content: &str) -> Vec<Volume> {
             continue;
         };
 
-        if !source.starts_with("/dev/") {
+        // ecryptfs (encrypted $HOME) is backed by a plain directory, not a
+        // block device, but it is the mount users care about most.
+        if !source.starts_with("/dev/") && fstype != "ecryptfs" {
             continue;
         }
 
@@ -215,6 +217,13 @@ overlay /var/lib/docker/overlay2/abc/merged overlay rw 0 0
         let content = "/dev/sdb1 /mnt/My\\040Drive ext4 rw,relatime 0 0\n";
         let volumes = parse_mounts(content);
         assert_eq!(volumes[0].mountpoint, "/mnt/My Drive");
+    }
+
+    #[test]
+    fn keeps_ecryptfs_home() {
+        let content = "/home/.ecryptfs/u/.Private /home/u ecryptfs rw,nosuid 0 0\n";
+        let volumes = parse_mounts(content);
+        assert_eq!(volumes[0].mountpoint, "/home/u");
     }
 
     #[test]
