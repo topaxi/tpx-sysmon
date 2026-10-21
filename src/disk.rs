@@ -93,8 +93,12 @@ fn parse_mounts(content: &str) -> Vec<Volume> {
             }
         };
 
-        // Prefer the shortest (parent-most) mountpoint for display/df.
-        if mountpoint.len() < volume.mountpoint.len() {
+        // Prefer the parent-most mountpoint (fewest path components) for
+        // display/df. Ties keep the first one listed in /proc/mounts, so
+        // /home wins over /nix when both are mounted from one device.
+        if mountpoint.split('/').filter(|c| !c.is_empty()).count()
+            < volume.mountpoint.split('/').filter(|c| !c.is_empty()).count()
+        {
             volume.mountpoint = mountpoint.clone();
         }
 
@@ -224,6 +228,15 @@ overlay /var/lib/docker/overlay2/abc/merged overlay rw 0 0
         let content = "/home/.ecryptfs/u/.Private /home/u ecryptfs rw,nosuid 0 0\n";
         let volumes = parse_mounts(content);
         assert_eq!(volumes[0].mountpoint, "/home/u");
+    }
+
+    #[test]
+    fn equal_depth_mounts_keep_first_listed() {
+        let content = "\
+/dev/nvme0n1p4 /home xfs rw 0 0
+/dev/nvme0n1p4 /nix xfs rw 0 0
+";
+        assert_eq!(parse_mounts(content)[0].mountpoint, "/home");
     }
 
     #[test]
